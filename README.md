@@ -58,8 +58,8 @@ Python, FastAPI, Pydantic, Uvicorn, Requests, Streamlit, any OpenAI-compatible L
 **Prerequisites:** Python 3.10+, an [Auto.dev](https://auto.dev) API key, and an LLM: either a free [Groq](https://console.groq.com/keys) API key, or [Ollama](https://ollama.com) running locally (no key needed).
 
 ```bash
-git clone https://github.com/FrankOceanLover-MK/GenAI---Capstone-Project.git
-cd GenAI---Capstone-Project
+git clone https://github.com/FrankOceanLover-MK/carwise-ai.git
+cd carwise-ai
 
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
