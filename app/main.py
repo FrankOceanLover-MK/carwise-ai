@@ -3,12 +3,13 @@ load_dotenv()
 
 from typing import Dict, Any, List, Optional, Tuple
 import json
+import re
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from external_apis import get_car_profile_from_vin, ApiError as ExternalApiError, fetch_active_listings
-from schemas import (
+from app.external_apis import get_car_profile_from_vin, ApiError as ExternalApiError
+from app.schemas import (
     CarProfile,
     SearchResponse,
     SearchCriteriaModel,
@@ -16,19 +17,19 @@ from schemas import (
     ScoreBreakdownModel,
     SearchListing,
 )
-from llm_client import chat_completion, LLMError  # Or from ollama_client if that's what you're using
-from llm_prompts import (
+from app.llm_client import chat_completion, get_llm_info, LLMError
+from app.llm_prompts import (
     build_car_advice_messages,
     build_filter_extraction_messages,
     build_recommendation_messages,
-    SYSTEM_PROMPT  # ADD THIS IMPORT
+    SYSTEM_PROMPT,
 )
-from search import search as search_pipeline, SearchCriteria
+from app.search import search as search_pipeline, SearchCriteria, canonical_make
 
 import logging
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="GenAI Car Assistant Backend")
@@ -43,7 +44,7 @@ def health() -> Dict[str, str]:
     """
     Simple health check used by the Streamlit frontend.
     """
-    return {"status": "ok", "mode": "local_llm"}
+    return {"status": "ok", **get_llm_info()}
 
 
 # -------------------------------------------------------------------
@@ -179,6 +180,9 @@ class ChatRequest(BaseModel):
     question: str
     vin: Optional[str] = None
     history: List[Dict[str, str]] = Field(default_factory=list)
+    zip_code: Optional[str] = Field(
+        None, description="5-digit US ZIP code the shopper searches from (needed for 'near me')."
+    )
 
 
 class ChatResponse(BaseModel):
@@ -267,10 +271,22 @@ def extract_filters_from_question(question: str) -> Dict[str, Any]:
     if isinstance(fuel_type, str) and fuel_type.strip():
         filters["fuel_type"] = fuel_type.strip()
 
+    make = data.get("make")
+    if isinstance(make, str) and make.strip():
+        filters["make"] = canonical_make(make.strip())
+
+    model = data.get("model")
+    if isinstance(model, str) and model.strip():
+        filters["model"] = model.strip()
+
+    color = data.get("color")
+    if isinstance(color, str) and color.strip():
+        filters["color"] = color.strip()
+
     return filters
 
 
-def build_criteria_from_filters(filters: Dict[str, Any]) -> SearchCriteria:
+def build_criteria_from_filters(filters: Dict[str, Any], zip_code: Optional[str] = None) -> SearchCriteria:
     """
     Map filter dict into a SearchCriteria dataclass.
     """
@@ -279,6 +295,45 @@ def build_criteria_from_filters(filters: Dict[str, Any]) -> SearchCriteria:
         max_distance=_parse_number_maybe(filters.get("max_distance")),
         body_style=(filters.get("body_style") or None),
         fuel_type=(filters.get("fuel_type") or None),
+        make=(filters.get("make") or None),
+        model=(filters.get("model") or None),
+        color=(filters.get("color") or None),
+        zip_code=zip_code,
+    )
+
+
+def _clean_zip(value: Optional[str]) -> Optional[str]:
+    """Return a valid 5-digit US ZIP, or None."""
+    if not value:
+        return None
+    value = value.strip()
+    return value if re.fullmatch(r"\d{5}", value) else None
+
+
+_NEARBY_WORDS = re.compile(r"\b(near me|nearby|near by|close to me|around me|local(ly)?|in my area)\b", re.I)
+
+
+def _no_results_message(filters: Dict[str, Any], zip_code: Optional[str]) -> str:
+    """Deterministic reply when the live search finds nothing, so the LLM can't invent cars."""
+    tips = []
+    if filters.get("budget"):
+        tips.append("raising your budget a little")
+    if filters.get("max_distance") or zip_code:
+        tips.append("widening the distance")
+    if filters.get("body_style"):
+        tips.append("trying a different body style")
+    if filters.get("color"):
+        tips.append("trying a different color or dropping the color")
+    if filters.get("fuel_type"):
+        tips.append("trying a different fuel type")
+    if filters.get("model"):
+        tips.append("trying a different model")
+    elif filters.get("make"):
+        tips.append("trying a different brand")
+    tips.append("loosening other requirements")
+    return (
+        "I couldn't find any live listings that match that right now. "
+        "You could try " + ", ".join(tips[:-1]) + (", or " if len(tips) > 1 else "") + tips[-1] + "."
     )
 
 
@@ -358,20 +413,52 @@ def chat_with_llm(payload: ChatRequest) -> ChatResponse:
     )
 
     filters = extract_filters_from_question(rich_query)
-    criteria = build_criteria_from_filters(filters)
+    zip_code = _clean_zip(payload.zip_code)
 
-    # Run search
-    try:
-        results = search_pipeline(criteria, top_k=5)
-    except Exception as e:
-        logger.error(f"Search failed: {e}", exc_info=True)
-        # Return a friendly response instead of crashing
+    # "Near me" and "within X miles" need a starting point
+    if not zip_code and (filters.get("max_distance") or _NEARBY_WORDS.search(question)):
         return ChatResponse(
             mode="general",
             question=question,
-            vin=None,
-            summary=None,
-            answer=f"I'm having trouble searching for vehicles right now. The search service returned an error: {str(e)[:100]}",
+            answer=(
+                "I can look for cars near you, but I need to know where you are first. "
+                "Enter your ZIP code in the box at the top of the page and ask again."
+            ),
+            filters=filters,
+            listings=[],
+        )
+
+    criteria = build_criteria_from_filters(filters, zip_code)
+    if zip_code:
+        filters = {**filters, "zip_code": zip_code}
+
+    # Run search (top 3, so the written advice and the cards always describe the same cars)
+    try:
+        results = search_pipeline(criteria, top_k=3)
+    except ExternalApiError as e:
+        logger.error("Live listings unavailable: %s", e)
+        return ChatResponse(
+            mode="general",
+            question=question,
+            answer=f"I couldn't reach the live listings service just now ({e}) Please try again in a moment.",
+            filters=filters,
+            listings=[],
+        )
+    except Exception as e:
+        logger.error(f"Search failed: {e}", exc_info=True)
+        return ChatResponse(
+            mode="general",
+            question=question,
+            answer="Something went wrong while searching for vehicles. Please try again.",
+            filters=filters,
+            listings=[],
+        )
+
+    if not results:
+        return ChatResponse(
+            mode="general",
+            question=question,
+            answer=_no_results_message(filters, zip_code),
             filters=filters,
             listings=[],
         )
@@ -379,9 +466,14 @@ def chat_with_llm(payload: ChatRequest) -> ChatResponse:
     listing_models: List[SearchListing] = []
     listing_dicts: List[Dict[str, Any]] = []
     for r in results:
-        model = SearchListing(**r.listing)
+        try:
+            model = SearchListing(**r.listing)
+        except Exception as e:  # one odd listing should not break the whole answer
+            logger.warning("Skipping a listing that did not validate: %s", e)
+            continue
+        model.match_score = round(r.total_score * 100)
         listing_models.append(model)
-        listing_dicts.append(model.dict())
+        listing_dicts.append({**model.dict(), "color": r.listing.get("color")})  # color is for the LLM text only
 
     # Use the existing build_recommendation_messages function
     messages = build_recommendation_messages(
@@ -426,6 +518,7 @@ def search_inventory(payload: SearchCriteriaModel) -> SearchResponse:
         max_distance=payload.max_distance,
         body_style=payload.body_style,
         fuel_type=payload.fuel_type,
+        zip_code=_clean_zip(payload.zip_code),
     )
     
     try:
@@ -436,6 +529,8 @@ def search_inventory(payload: SearchCriteriaModel) -> SearchResponse:
             for i, r in enumerate(results[:3]):
                 logger.debug(f"Result {i}: {r.listing.get('make')} {r.listing.get('model')} - Score: {r.total_score:.2f}")
         
+    except ExternalApiError as e:
+        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         logger.error(f"Search failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")

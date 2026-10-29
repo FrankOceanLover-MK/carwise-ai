@@ -1,12 +1,17 @@
+import datetime
+import logging
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 AUTO_DEV_API_KEY = os.getenv("AUTO_DEV_API_KEY")
 
@@ -106,7 +111,7 @@ def nhtsa_decode_vin(vin: str, model_year: int | None = None) -> Dict[str, Any]:
         cache_set(cache_key, flat)
         return flat
     except requests.exceptions.RequestException as e:
-        print(f"NHTSA API warning: {e}")
+        logger.warning(f"NHTSA API warning: {e}")
         return {}
 
 
@@ -138,7 +143,7 @@ def carquery_get_trims(make: str, model: str, year: int) -> List[Dict[str, Any]]
         resp = requests.get(url, params=params, headers=headers, timeout=10)
 
         if resp.status_code == 403:
-            print("CarQuery returned 403 Forbidden; skipping trims.")
+            logger.warning("CarQuery returned 403 Forbidden; skipping trims.")
             cache_set(cache_key, [])
             return []
 
@@ -148,7 +153,7 @@ def carquery_get_trims(make: str, model: str, year: int) -> List[Dict[str, Any]]
         cache_set(cache_key, trims)
         return trims
     except requests.exceptions.RequestException as e:
-        print(f"CarQuery error: {e}")
+        logger.warning(f"CarQuery error: {e}")
         cache_set(cache_key, [])
         return []
 
@@ -280,7 +285,7 @@ def get_safety_rating(year: int, make: str, model: str) -> Optional[int]:
         return rating
 
     except Exception as e:
-        print(f"NHTSA Safety API Error for {year} {make} {model}: {e}")
+        logger.warning(f"NHTSA Safety API Error for {year} {make} {model}: {e}")
         cache_set(cache_key, None)
         return None
 
@@ -317,7 +322,7 @@ def get_car_profile_from_vin(vin: str) -> Dict[str, Any]:
         try:
             economy = get_economy_from_carquery(year=year, make=make, model=model)
         except Exception as e:
-            print(f"CarQuery economy lookup failed: {e}")
+            logger.warning(f"CarQuery economy lookup failed: {e}")
 
     # Get safety rating
     safety_stars = None
@@ -325,7 +330,7 @@ def get_car_profile_from_vin(vin: str) -> Dict[str, Any]:
         try:
             safety_stars = get_safety_rating(year, make, model)
         except Exception as e:
-            print(f"Safety rating lookup failed: {e}")
+            logger.warning(f"Safety rating lookup failed: {e}")
 
     # Build profile
     profile: Dict[str, Any] = {
@@ -364,6 +369,48 @@ def get_car_profile_from_vin(vin: str) -> Dict[str, Any]:
 # 7) Auto.dev Listings Search (Enhanced with better error handling)
 # -------------------------------------------------------------------
 
+def _http_url(value: Any) -> Optional[str]:
+    """Return value as an https URL if it looks like a web URL, else None."""
+    if isinstance(value, str) and value.startswith(("http://", "https://")):
+        return "https://" + value[len("http://"):] if value.startswith("http://") else value
+    return None
+
+
+def _first_image_url(item: Dict[str, Any], retail: Dict[str, Any]) -> Optional[str]:
+    """Find the best photo URL in an Auto.dev listing (field names vary by plan/version)."""
+    candidates: List[Any] = []
+    for src in (retail, item):
+        for key in ("primaryImage", "primaryPhoto", "primaryPhotoUrl", "image", "imageUrl"):
+            candidates.append(src.get(key))
+        for key in ("photoUrls", "photos", "images"):
+            photos = src.get(key)
+            if isinstance(photos, list) and photos:
+                first = photos[0]
+                candidates.append(first.get("url") if isinstance(first, dict) else first)
+    for c in candidates:
+        url = _http_url(c)
+        if url:
+            return url
+    return None
+
+
+def _as_text(value: Any) -> Optional[str]:
+    """Return value as a clean string, or None when it is missing."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _color_text(value: Any) -> Optional[str]:
+    """Auto.dev's color field may be a plain string or a small object; return readable text or None."""
+    if isinstance(value, dict):
+        value = value.get("name") or value.get("value") or value.get("generic") or value.get("simple")
+    if isinstance(value, str) and value.strip() and value.strip().lower() not in {"unknown", "n/a", "none"}:
+        return value.strip()
+    return None
+
+
 def _map_auto_dev_listing_to_schema(item: Dict[str, Any]) -> Dict[str, Any]:
     """Map Auto.dev listing format to our internal schema."""
     vehicle = item.get("vehicle", {}) or {}
@@ -374,48 +421,52 @@ def _map_auto_dev_listing_to_schema(item: Dict[str, Any]) -> Dict[str, Any]:
     distance = item.get("distance")
 
     vin = vehicle.get("vin") or item.get("vin")
-    
-    # Get listing ID for constructing URL
-    listing_id = item.get("id")
-    
-    # Try multiple URL sources
+
+    # Only link to a real dealer/listing page. Never invent a URL that may be dead.
     listing_url = None
-    url_sources = [
-        retail.get("vdp"),        # Primary field
+    for candidate in (
+        retail.get("vdp"),
         item.get("vdp_url"),
         item.get("vdpUrl"),
         retail.get("url"),
         item.get("url"),
-    ]
-    
-    for url in url_sources:
-        if url and isinstance(url, str) and url.startswith(("http://", "https://")):
-            listing_url = url
+    ):
+        listing_url = _http_url(candidate)
+        if listing_url:
             break
-    
-    # If no URL found, construct one from listing ID
-    if not listing_url and listing_id:
-        listing_url = f"https://auto.dev/listings/{listing_id}"
-    elif not listing_url and vin:
-        listing_url = f"https://auto.dev/inventory/{vin}"
+
+    # Auto.dev sometimes puts the brand inside the model ("Mazda CX-30"), which shows as "Mazda Mazda CX-30".
+    # Auto.dev can return numbers where we expect text (the Ram "1500" comes back as the integer 1500).
+    make_name = _as_text(vehicle.get("make"))
+    model_name = _as_text(vehicle.get("model"))
+    if make_name and isinstance(model_name, str):
+        prefix = str(make_name).strip() + " "
+        if model_name.lower().startswith(prefix.lower()) and len(model_name) > len(prefix):
+            model_name = model_name[len(prefix):].strip()
 
     return {
         "id": item.get("id") or str(vin) or f"listing_{id(item)}",
         "year": vehicle.get("year"),
-        "make": vehicle.get("make"),
-        "model": vehicle.get("model"),
-        "trim": item.get("trim") or vehicle.get("trim"),
+        "make": make_name,
+        "model": model_name,
+        "trim": _as_text(item.get("trim") or vehicle.get("trim")),
         "price": price,
         "mileage": mileage,
         "distance_miles": distance,
-        "fuel_type": vehicle.get("fuel"),
-        "body_style": vehicle.get("bodyStyle"),
+        "fuel_type": _as_text(vehicle.get("fuel")),
+        "body_style": _as_text(vehicle.get("bodyStyle")),
+        "color": _color_text(vehicle.get("exteriorColor")),
+        "interior_color": _color_text(vehicle.get("interiorColor")),
         "city_mpg": vehicle.get("cityMpg"),
         "highway_mpg": vehicle.get("highwayMpg"),
         "safety_rating": None,  # Can be enriched later
         "source": "auto.dev",
         "vin": vin,
         "listing_url": listing_url,
+        "image_url": _first_image_url(item, retail),
+        "dealer": retail.get("dealer"),
+        "city": retail.get("city"),
+        "state": retail.get("state"),
     }
 
 
@@ -424,75 +475,83 @@ def fetch_active_listings(
     min_year: Optional[int] = None,
     make: Optional[str] = None,
     body_style: Optional[str] = None,
-    limit: int = 15
+    zip_code: Optional[str] = None,
+    max_distance: Optional[float] = None,
+    limit: int = 15,
+    pages: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Call Auto.dev GET /listings to find real cars with enhanced error handling.
+    """Call Auto.dev GET /listings and return normalized live listings.
+
+    Returns an empty list when nothing matches. Raises ApiError when the service
+    can't be reached or returns an error, so "no results" and "service down" differ.
     """
     if not AUTO_DEV_API_KEY:
-        print("Warning: AUTO_DEV_API_KEY not set. Returning empty results.")
-        return []
+        raise ApiError("AUTO_DEV_API_KEY is not set. Add it to your .env file.")
+    if pages is None:
+        pages = int(os.getenv("AUTO_DEV_PAGES", "3"))
 
     url = "https://api.auto.dev/listings"
-    
-    params = {
-        "apikey": AUTO_DEV_API_KEY,
-        "limit": limit,
-    }
-    
-    # Build filters based on Auto.dev API documentation
+    params: Dict[str, Any] = {"apikey": AUTO_DEV_API_KEY, "limit": limit}
+
+    # Filters from the Auto.dev listings docs
     if budget:
         params["retailListing.price"] = f"1-{int(budget)}"
     if min_year:
-        params["vehicle.year"] = f"{min_year}-2025"
+        params["vehicle.year"] = f"{min_year}-{datetime.date.today().year + 1}"
     if make:
         params["vehicle.make"] = make
     if body_style:
         params["vehicle.bodyStyle"] = body_style
+    if zip_code:
+        params["zip"] = zip_code
+        params["distance"] = int(max_distance or 50)  # Auto.dev defaults to 50 miles
 
-    headers = {
-        "Authorization": f"Bearer {AUTO_DEV_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {AUTO_DEV_API_KEY}", "Content-Type": "application/json"}
 
-    try:
-        resp = requests.get(url, params=params, headers=headers, timeout=30)
-        
+    # One page is small on the free plan (20 listings), and the newest listings often repeat the same
+    # model, so read a few pages to give the ranking (and the variety picker) more to work with.
+    def fetch_page(page: int) -> List[Dict[str, Any]]:
+        """Return one page of raw listings. Raises ApiError on any failure."""
+        try:
+            resp = requests.get(url, params={**params, "page": page}, headers=headers, timeout=30)
+        except requests.exceptions.Timeout as e:
+            logger.warning("Auto.dev listings request timed out (page %d)", page)
+            raise ApiError("The listings service timed out.") from e
+        except requests.RequestException as e:
+            logger.warning("Failed to reach Auto.dev: %s", e)
+            raise ApiError("Could not reach the listings service.") from e
         if resp.status_code != 200:
-            print(f"Auto.dev listings error: {resp.status_code}")
-            try:
-                error_detail = resp.json()
-                print(f"Error details: {error_detail}")
-            except:
-                print(f"Response text: {resp.text[:500]}")
-            return []
-            
-        data = resp.json()
-        raw_listings = data.get("data", [])
-        
-        if not raw_listings:
-            print("No listings returned from Auto.dev")
-            return []
-        
-        clean_listings = []
-        for raw in raw_listings:
-            try:
-                clean = _map_auto_dev_listing_to_schema(raw)
-                # Validate minimum required fields
-                if clean.get("year") and clean.get("make") and clean.get("model"):
-                    clean_listings.append(clean)
-                else:
-                    print(f"Skipping listing with missing core fields: {clean.get('id')}")
-            except Exception as e:
-                print(f"Error mapping listing: {e}")
-                continue
-                
-        print(f"Successfully processed {len(clean_listings)} listings from Auto.dev")
-        return clean_listings
+            logger.warning("Auto.dev listings error %s: %s", resp.status_code, resp.text[:300])
+            raise ApiError(f"The listings service returned an error ({resp.status_code}).")
+        try:
+            return resp.json().get("data", []) or []
+        except ValueError as e:
+            raise ApiError("The listings service returned an unreadable response.") from e
 
-    except requests.exceptions.Timeout:
-        print("Auto.dev listings request timed out")
-        return []
-    except Exception as e:
-        print(f"Failed to fetch listings: {e}")
-        return []
+    # Page 1 decides whether the service is up (errors here are shown to the shopper).
+    raw_listings: List[Dict[str, Any]] = list(fetch_page(1))
+
+    # Pages 2+ are fetched at the same time, so six pages take about as long as one or two.
+    # A page that fails is skipped; the pages that did load are still used.
+    extra_pages = list(range(2, max(1, pages) + 1))
+    if raw_listings and extra_pages:
+        with ThreadPoolExecutor(max_workers=min(5, len(extra_pages))) as pool:
+            futures = [pool.submit(fetch_page, p) for p in extra_pages]
+            for fut in futures:  # in page order, so the newest listings stay first
+                try:
+                    raw_listings.extend(fut.result())
+                except ApiError:
+                    continue
+
+    clean_listings: List[Dict[str, Any]] = []
+    for raw in raw_listings:
+        try:
+            clean = _map_auto_dev_listing_to_schema(raw)
+        except Exception as e:  # skip a malformed row rather than failing the whole search
+            logger.warning("Error mapping listing: %s", e)
+            continue
+        if clean.get("year") and clean.get("make") and clean.get("model"):
+            clean_listings.append(clean)
+
+    logger.info("Auto.dev returned %d usable listings", len(clean_listings))
+    return clean_listings

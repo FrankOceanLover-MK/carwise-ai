@@ -48,7 +48,7 @@ def build_car_advice_messages(user_question: str, car_summary: str) -> List[Dict
             "content": (
                 "A customer is asking about a specific vehicle. Here's what we know about it:\n\n"
                 f"{car_summary}\n\n"
-                "Customer's question: {user_question}\n\n"
+                f"Customer's question: {user_question}\n\n"
                 "Please provide a helpful, grounded response. Use the data above to inform your answer, "
                 "but don't repeat the raw specs - instead explain what they mean for the customer. "
                 "Consider factors like reliability, cost of ownership, typical use cases, and known "
@@ -73,13 +73,26 @@ def build_filter_extraction_messages(user_query: str) -> List[Dict[str, str]]:
                 "- budget: max price in dollars (number or null)\n"
                 "- max_distance: max distance in miles (number or null)\n"
                 "- body_style: SUV, Sedan, Truck, Coupe, Hatchback, Wagon, Minivan (string or null)\n"
-                "- fuel_type: Gasoline, Diesel, Hybrid, Electric, Plug-in Hybrid (string or null)\n\n"
+                "- fuel_type: Gasoline, Diesel, Hybrid, Electric, Plug-in Hybrid (string or null)\n"
+                "- make: the brand, spelled the normal way, such as Toyota, Honda, Chevrolet, BMW, "
+                "Mercedes-Benz, Tesla (string or null)\n"
+                "- model: the specific model, such as Civic, CR-V, Model 3, F-150, Mustang (string or null)\n"
+                "- color: the exterior color, one simple word such as black, white, gray, silver, red, blue, "
+                "green, yellow, orange, brown, beige, purple, pink (string or null)\n\n"
                 "Interpretation guidelines:\n"
                 "- Budget: '30k' = 30000, 'around 25000' = 25000, 'under 20k' = 20000\n"
                 "- If user says 'affordable' or 'budget-friendly' without a number, use null\n"
                 "- Distance: 'nearby' = 50, 'local' = 30, 'within X miles' = X\n"
                 "- Body style: Map 'family car' to SUV, 'commuter' to Sedan, 'work vehicle' to Truck\n"
-                "- Fuel: 'good MPG' = null (let economy scoring handle it), 'electric' = Electric\n\n"
+                "- Fuel: 'good MPG' = null (let economy scoring handle it), 'electric', 'EV' or "
+                "'battery' = Electric, 'hybrid' = Hybrid, 'plug-in' or 'PHEV' = Plug-in Hybrid, "
+                "'gas' = Gasoline, 'diesel' = Diesel\n"
+                "- Make and model: only fill these in when the customer names a brand or a specific car. "
+                "'Chevy' = Chevrolet, 'VW' = Volkswagen. If they name only a model, fill in both, "
+                "for example 'Prius' = make Toyota and model Prius, 'Mustang' = make Ford and model Mustang. "
+                "'Honda' alone = make Honda and model null. Never guess a brand or model the customer did not mention.\n"
+                "- Fix obvious typos in what the customer wrote ('sudan' = Sedan, 'hybird' = Hybrid, "
+                "'honds' = Honda).\n\n"
                 "Output ONLY a JSON object. No explanations, no markdown, no extra text."
             ),
         },
@@ -123,6 +136,8 @@ def build_recommendation_messages(
                 details.append(car["body_style"])
             if car.get("fuel_type"):
                 details.append(car["fuel_type"])
+            if car.get("color"):
+                details.append(f"{car['color']} exterior")
             if car.get("distance_miles") is not None:
                 details.append(f"{car['distance_miles']:.0f} miles away")
             
@@ -156,6 +171,12 @@ def build_recommendation_messages(
         filter_summary_parts.append(f"{filters['body_style']} body style")
     if filters.get("fuel_type"):
         filter_summary_parts.append(f"{filters['fuel_type']} fuel type")
+    if filters.get("color"):
+        filter_summary_parts.append(f"{filters['color']} color")
+    if filters.get("make") or filters.get("model"):
+        filter_summary_parts.append(
+            "looking for " + " ".join(x for x in (filters.get("make"), filters.get("model")) if x)
+        )
     
     if filter_summary_parts:
         filter_summary = "Search criteria: " + ", ".join(filter_summary_parts)
@@ -173,15 +194,14 @@ def build_recommendation_messages(
                 f"Customer request: {user_query}\n\n"
                 f"{filter_summary}\n\n"
                 f"Available vehicles:\n{listings_text}\n\n"
-                "Please provide a helpful recommendation. Structure your response this way:\n\n"
-                "1. Start with a direct recommendation (1-2 sentences naming specific vehicles)\n"
-                "2. Explain why these vehicles fit the customer's needs (1-2 paragraphs covering key factors)\n"
-                "3. Note any important trade-offs or considerations (1 paragraph)\n"
-                "4. If no vehicles match, explain why and suggest how to adjust the search\n\n"
-                "Focus on the 2-3 best options. Use the actual numbers from the data above, but present "
-                "them naturally in context rather than listing them. Write in a friendly, consultative "
-                "tone as if you're helping a friend make a smart purchase. Remember: plain text only, "
-                "no markdown formatting."
+                "Write a short, friendly recommendation in plain text, 90 words or fewer, in two short paragraphs:\n"
+                "1. Name the single best vehicle from the list and say why it fits this customer.\n"
+                "2. Mention one trade-off, or one alternative from the list.\n\n"
+                "Only discuss vehicles from the list above and use their exact numbers. Do not repeat every "
+                "detail, because the customer can already see the full specs on a card next to your message. "
+                "Never invent vehicles, prices, or distances. Only mention a car's color if it is written in "
+                "the list above, and never guess one. "
+                "Plain text only, no markdown formatting."
             ),
         },
     ]

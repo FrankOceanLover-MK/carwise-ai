@@ -16,3 +16,8 @@ frontend/.env
 
 # Windows reserved device name
 nul
+
+# Tooling
+.pytest_cache/
+.idea/
+.vscode/

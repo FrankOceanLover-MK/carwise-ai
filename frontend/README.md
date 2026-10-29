@@ -5,7 +5,7 @@ This Streamlit app talks to your local FastAPI backend.
 ## Prereqs
 Run backend (from repo root):
 ```
-uvicorn main:app --reload
+uvicorn app.main:app --reload
 ```
 Expected endpoints:
 - GET /health

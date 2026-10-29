@@ -1,4 +1,7 @@
-from external_apis import (
+"""Manual smoke test that hits the real external APIs (needs AUTO_DEV_API_KEY). Run from the repo root:
+    python -m scripts.smoke_test_apis
+"""
+from app.external_apis import (
     auto_dev_vin_decode,
     nhtsa_decode_vin,
     carquery_get_trims,

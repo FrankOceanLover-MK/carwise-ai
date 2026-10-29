@@ -74,6 +74,10 @@ class SearchCriteriaModel(BaseModel):
         None,
         description="Desired fuel type such as gasoline, hybrid, electric.",
     )
+    zip_code: Optional[str] = Field(
+        None,
+        description="5-digit US ZIP code to search around (used with max_distance).",
+    )
     top_k: Optional[int] = Field(
         5,
         description="Maximum number of results to return.",
@@ -99,6 +103,11 @@ class SearchListing(BaseModel):
     # new fields
     vin: Optional[str] = None
     listing_url: Optional[str] = None
+    image_url: Optional[str] = None
+    dealer: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    match_score: Optional[int] = None  # 0-100, from the weighted scoring model
 
 
 
